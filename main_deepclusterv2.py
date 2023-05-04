@@ -1,10 +1,11 @@
-# Copyright (c) Facebook, Inc. and its affiliates.
+# Copyright (c) gacebook, Inc. and its affiliates.
 # All rights reserved.
 #
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
 #
-
+import sys
+sys.path.insert(0, "/cluster/customapps/biomed/vogtlab/users/palumboe/swav/src")
 import argparse
 import math
 import os
@@ -34,6 +35,14 @@ from src.utils import (
 from src.multicropdataset import MultiCropDataset
 import src.resnet50 as resnet_models
 
+from torch.utils.data import DataLoader
+from torchvision import transforms
+
+from datasets_polyMNIST import PolyMNISTDataset #t, transforms
+
+from sklearn.metrics import adjusted_rand_score, normalized_mutual_info_score
+
+
 logger = getLogger()
 
 parser = argparse.ArgumentParser(description="Implementation of DeepCluster-v2")
@@ -45,7 +54,7 @@ parser.add_argument("--data_path", type=str, default="/path/to/imagenet",
                     help="path to dataset repository")
 parser.add_argument("--nmb_crops", type=int, default=[2], nargs="+",
                     help="list of number of crops (example: [2, 6])")
-parser.add_argument("--size_crops", type=int, default=[224], nargs="+",
+parser.add_argument("--size_crops", type=int, default=[28], nargs="+",
                     help="crops resolutions (example: [224, 96])")
 parser.add_argument("--min_scale_crops", type=float, default=[0.14], nargs="+",
                     help="argument in RandomResizedCrop (example: [0.14, 0.05])")
@@ -61,7 +70,7 @@ parser.add_argument("--temperature", default=0.1, type=float,
                     help="temperature parameter in training loss")
 parser.add_argument("--feat_dim", default=128, type=int,
                     help="feature dimension")
-parser.add_argument("--nmb_prototypes", default=[3000, 3000, 3000], type=int, nargs="+",
+parser.add_argument("--nmb_prototypes", default=[10, 10, 10], type=int, nargs="+",
                     help="number of prototypes - it can be multihead")
 
 #########################
@@ -106,7 +115,7 @@ parser.add_argument("--checkpoint_freq", type=int, default=25,
 parser.add_argument("--sync_bn", type=str, default="pytorch", help="synchronize bn")
 parser.add_argument("--syncbn_process_group_size", type=int, default=8, help=""" see
                     https://github.com/NVIDIA/apex/blob/master/apex/parallel/__init__.py#L58-L67""")
-parser.add_argument("--dump_path", type=str, default=".",
+parser.add_argument("--dump_path", type=str, default="/cluster/work/vogtlab/Group/palumboe/swav_dump",
                     help="experiment dump path for checkpoints and log")
 parser.add_argument("--seed", type=int, default=31, help="seed")
 
@@ -117,7 +126,7 @@ def main():
     init_distributed_mode(args)
     fix_random_seeds(args.seed)
     logger, training_stats = initialize_exp(args, "epoch", "loss")
-
+    """
     # build data
     train_dataset = MultiCropDataset(
         args.data_path,
@@ -137,6 +146,18 @@ def main():
         drop_last=True
     )
     logger.info("Building data done with {} images loaded.".format(len(train_dataset)))
+    """
+    unim_datapaths_train = [args.data_path + "/PolyMNIST/train/" + "m" + str(1), args.data_path + "/PolyMNIST/train/" + "m" + str(2)]
+    unim_datapaths_test = [args.data_path + "/PolyMNIST/test/" + "m" + str(1), args.data_path + "/PolyMNIST/test/" + "m" + str(2)]
+    #kwargs = {'num_workers': 1, 'pin_memory': True} if device == 'cuda' else {}
+    tx = transforms.ToTensor()
+    train_loader = DataLoader(PolyMNISTDataset(unim_datapaths_train, transform=tx),
+                       batch_size=args.batch_size, shuffle=True)#, **kwargs)
+    test_loader = DataLoader(PolyMNISTDataset(unim_datapaths_test, transform=tx),
+                      batch_size=args.batch_size, shuffle=True)#, **kwargs)
+    train_dataset = train_loader.dataset
+
+    logger.info("Building data done with {} images loaded.".format(len(train_dataset)))
 
     # build model
     model = resnet_models.__dict__[args.arch](
@@ -150,7 +171,7 @@ def main():
         model = nn.SyncBatchNorm.convert_sync_batchnorm(model)
     elif args.sync_bn == "apex":
         # with apex syncbn we sync bn per group because it speeds up computation
-        # compared to global syncbn
+        # compared to globag syncb
         process_group = apex.parallel.create_syncbn_process_group(args.syncbn_process_group_size)
         model = apex.parallel.convert_syncbn_model(model, process_group=process_group)
     # copy model to GPU
@@ -183,12 +204,12 @@ def main():
 
     # optionally resume from a checkpoint
     to_restore = {"epoch": 0}
-    restart_from_checkpoint(
-        os.path.join(args.dump_path, "checkpoint.pth.tar"),
-        run_variables=to_restore,
-        state_dict=model,
-        optimizer=optimizer,
-    )
+    #restart_from_checkpoint(
+    #    os.path.join(args.dump_path, "checkpoint.pth.tar"),
+    #    run_variables=to_restore,
+    #    state_dict=model,
+    #    optimizer=optimizer,
+    #)
     start_epoch = to_restore["epoch"]
 
     # build the memory bank
@@ -207,7 +228,7 @@ def main():
         logger.info("============ Starting epoch %i ... ============" % epoch)
 
         # set sampler
-        train_loader.sampler.set_epoch(epoch)
+        #train_loader.sampler.set_epoch(epoch)
 
         # train the network
         scores, local_memory_index, local_memory_embeddings = train(
@@ -249,11 +270,15 @@ def train(loader, model, optimizer, epoch, schedule, local_memory_index, local_m
     cross_entropy = nn.CrossEntropyLoss(ignore_index=-100)
 
     assignments = cluster_memory(model, local_memory_index, local_memory_embeddings, len(loader.dataset))
+    labels = [loader.dataset[idx][-1] for idx in range(assignments.size(1))] 
+    with torch.no_grad():
+        print(normalized_mutual_info_score(labels, assignments[0,:].cpu().detach().numpy()))
     logger.info('Clustering for epoch {} done.'.format(epoch))
 
     end = time.time()
     start_idx = 0
-    for it, (idx, inputs) in enumerate(loader):
+    for it, (idx, inputs, _) in enumerate(loader):
+        # print(inputs)
         # measure data loading time
         data_time.update(time.time() - end)
 
@@ -273,6 +298,8 @@ def train(loader, model, optimizer, epoch, schedule, local_memory_index, local_m
             scores = output[h] / args.temperature
             targets = assignments[h][idx].repeat(sum(args.nmb_crops)).cuda(non_blocking=True)
             loss += cross_entropy(scores, targets)
+            #print(scores.size(), targets.size())
+            #print(normalized_mutual_info_score(targets.cpu().detach().numpy(), scores.cpu().detach().numpy()))
         loss /= len(args.nmb_prototypes)
 
         # ============ backward and optim step ... ============
@@ -321,7 +348,7 @@ def init_memory(dataloader, model):
     start_idx = 0
     with torch.no_grad():
         logger.info('Start initializing the memory banks')
-        for index, inputs in dataloader:
+        for index, inputs, _ in dataloader:
             nmb_unique_idx = inputs[0].size(0)
             index = index.cuda(non_blocking=True)
 

@@ -4,6 +4,8 @@
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
 #
+import sys
+sys.path.insert(0, "/cluster/customapps/biomed/vogtlab/users/palumboe/swav/src")
 import argparse
 import math
 import os
@@ -19,6 +21,7 @@ import torch.nn.parallel
 import torch.backends.cudnn as cudnn
 import torch.distributed as dist
 import torch.optim
+#import collections.abc as container_abcs
 import apex
 from apex.parallel.LARC import LARC
 
@@ -33,6 +36,13 @@ from src.utils import (
 from src.multicropdataset import MultiCropDataset
 import src.resnet50 as resnet_models
 
+from torch.utils.data import DataLoader
+from torchvision import transforms
+
+from datasets_polyMNIST import PolyMNISTDataset #t, transforms
+
+from sklearn.metrics import adjusted_rand_score, normalized_mutual_info_score
+
 logger = getLogger()
 
 parser = argparse.ArgumentParser(description="Implementation of SwAV")
@@ -42,9 +52,9 @@ parser = argparse.ArgumentParser(description="Implementation of SwAV")
 #########################
 parser.add_argument("--data_path", type=str, default="/path/to/imagenet",
                     help="path to dataset repository")
-parser.add_argument("--nmb_crops", type=int, default=[2], nargs="+",
+parser.add_argument("--nmb_crops", type=int, default=[5], nargs="+",
                     help="list of number of crops (example: [2, 6])")
-parser.add_argument("--size_crops", type=int, default=[224], nargs="+",
+parser.add_argument("--size_crops", type=int, default=[28], nargs="+",
                     help="crops resolutions (example: [224, 96])")
 parser.add_argument("--min_scale_crops", type=float, default=[0.14], nargs="+",
                     help="argument in RandomResizedCrop (example: [0.14, 0.05])")
@@ -54,17 +64,17 @@ parser.add_argument("--max_scale_crops", type=float, default=[1], nargs="+",
 #########################
 ## swav specific params #
 #########################
-parser.add_argument("--crops_for_assign", type=int, nargs="+", default=[0, 1],
+parser.add_argument("--crops_for_assign", type=int, nargs="+", default=[0, 1, 2, 3, 4],
                     help="list of crops id used for computing assignments")
-parser.add_argument("--temperature", default=0.1, type=float,
+parser.add_argument("--temperature", default=5., type=float,
                     help="temperature parameter in training loss")
 parser.add_argument("--epsilon", default=0.05, type=float,
                     help="regularization parameter for Sinkhorn-Knopp algorithm")
 parser.add_argument("--sinkhorn_iterations", default=3, type=int,
                     help="number of iterations in Sinkhorn-Knopp algorithm")
-parser.add_argument("--feat_dim", default=128, type=int,
+parser.add_argument("--feat_dim", default=64, type=int,
                     help="feature dimension")
-parser.add_argument("--nmb_prototypes", default=3000, type=int,
+parser.add_argument("--nmb_prototypes", default=10, type=int,
                     help="number of prototypes")
 parser.add_argument("--queue_length", type=int, default=0,
                     help="length of the queue (0 for no queue)")
@@ -74,16 +84,16 @@ parser.add_argument("--epoch_queue_starts", type=int, default=15,
 #########################
 #### optim parameters ###
 #########################
-parser.add_argument("--epochs", default=100, type=int,
+parser.add_argument("--epochs", default=150, type=int,
                     help="number of total epochs to run")
 parser.add_argument("--batch_size", default=64, type=int,
                     help="batch size per gpu, i.e. how many unique instances per gpu")
-parser.add_argument("--base_lr", default=4.8, type=float, help="base learning rate")
-parser.add_argument("--final_lr", type=float, default=0, help="final learning rate")
-parser.add_argument("--freeze_prototypes_niters", default=313, type=int,
+parser.add_argument("--base_lr", default=1.0, type=float, help="base learning rate")
+parser.add_argument("--final_lr", type=float, default=0., help="final learning rate")
+parser.add_argument("--freeze_prototypes_niters", default=10000, type=int,
                     help="freeze the prototypes during this many iterations from the start")
 parser.add_argument("--wd", default=1e-6, type=float, help="weight decay")
-parser.add_argument("--warmup_epochs", default=10, type=int, help="number of warmup epochs")
+parser.add_argument("--warmup_epochs", default=0, type=int, help="number of warmup epochs")
 parser.add_argument("--start_warmup", default=0, type=float,
                     help="initial warmup learning rate")
 
@@ -104,7 +114,7 @@ parser.add_argument("--local_rank", default=0, type=int,
 #### other parameters ###
 #########################
 parser.add_argument("--arch", default="resnet50", type=str, help="convnet architecture")
-parser.add_argument("--hidden_mlp", default=2048, type=int,
+parser.add_argument("--hidden_mlp", default=256, type=int,
                     help="hidden layer dimension in projection head")
 parser.add_argument("--workers", default=10, type=int,
                     help="number of data loading workers")
@@ -115,7 +125,7 @@ parser.add_argument("--use_fp16", type=bool_flag, default=True,
 parser.add_argument("--sync_bn", type=str, default="pytorch", help="synchronize bn")
 parser.add_argument("--syncbn_process_group_size", type=int, default=8, help=""" see
                     https://github.com/NVIDIA/apex/blob/master/apex/parallel/__init__.py#L58-L67""")
-parser.add_argument("--dump_path", type=str, default=".",
+parser.add_argument("--dump_path", type=str, default="/cluster/work/vogtlab/Group/palumboe/swav_dump",
                     help="experiment dump path for checkpoints and log")
 parser.add_argument("--seed", type=int, default=31, help="seed")
 
@@ -123,9 +133,12 @@ parser.add_argument("--seed", type=int, default=31, help="seed")
 def main():
     global args
     args = parser.parse_args()
+    print(args)
     init_distributed_mode(args)
     fix_random_seeds(args.seed)
     logger, training_stats = initialize_exp(args, "epoch", "loss")
+    
+    """
 
     # build data
     train_dataset = MultiCropDataset(
@@ -144,6 +157,24 @@ def main():
         pin_memory=True,
         drop_last=True
     )
+
+    """
+    unim_datapaths_train = [args.data_path + "/PolyMNIST/train/" + "m" + str(idd) for idd in [0,1,2,3,4]]
+    unim_datapaths_test = [args.data_path + "/PolyMNIST/test/" + "m" + str(idd) for idd in [0,1,2,3,4]] 
+    #kwargs = {'num_workers': 1, 'pin_memory': True} if device == 'cuda' else {}
+    
+    meantfm = [0.485, 0.456, 0.406]
+    stdtfm = [0.228, 0.224, 0.225]
+    tx = transforms.Compose([
+                transforms.ToTensor(),
+                transforms.Normalize(mean=meantfm, std=stdtfm)])
+
+    train_loader = DataLoader(PolyMNISTDataset(unim_datapaths_train, transform=tx),
+                       batch_size=args.batch_size, shuffle=True)#, **kwargs)
+    test_loader = DataLoader(PolyMNISTDataset(unim_datapaths_test, transform=tx),
+                      batch_size=args.batch_size, shuffle=True)#, **kwargs)
+    train_dataset = train_loader.dataset
+
     logger.info("Building data done with {} images loaded.".format(len(train_dataset)))
 
     # build model
@@ -195,13 +226,13 @@ def main():
 
     # optionally resume from a checkpoint
     to_restore = {"epoch": 0}
-    restart_from_checkpoint(
-        os.path.join(args.dump_path, "checkpoint.pth.tar"),
-        run_variables=to_restore,
-        state_dict=model,
-        optimizer=optimizer,
-        amp=apex.amp,
-    )
+    #restart_from_checkpoint(
+    #    os.path.join(args.dump_path, "checkpoint.pth.tar"),
+    #    run_variables=to_restore,
+    #    state_dict=model,
+    #    optimizer=optimizer,
+    #    amp=apex.amp,
+    #)
     start_epoch = to_restore["epoch"]
 
     # build the queue
@@ -220,7 +251,7 @@ def main():
         logger.info("============ Starting epoch %i ... ============" % epoch)
 
         # set sampler
-        train_loader.sampler.set_epoch(epoch)
+        #train_loader.sampler.set_epoch(epoch)
 
         # optionally starts a queue
         if args.queue_length > 0 and epoch >= args.epoch_queue_starts and queue is None:
@@ -232,6 +263,7 @@ def main():
 
         # train the network
         scores, queue = train(train_loader, model, optimizer, epoch, lr_schedule, queue)
+        test(test_loader, model, optimizer, epoch, lr_schedule, queue)
         training_stats.update(scores)
 
         # save checkpoints
@@ -255,6 +287,62 @@ def main():
         if queue is not None:
             torch.save({"queue": queue}, queue_path)
 
+def test(train_loader, model, optimizer, epoch, lr_schedule, queue):
+    batch_time = AverageMeter()
+    data_time = AverageMeter()
+    losses = AverageMeter()
+
+    model.eval()
+    use_the_queue = False
+    with torch.no_grad():
+        end = time.time()
+        nmis, aris = [],[]
+        for it, inputs in enumerate(train_loader):
+            # measure data loading time
+            labels_batch = inputs[1]
+            inputs = inputs[0]
+            data_time.update(time.time() - end)
+
+            # normalize the prototypes
+            w = model.module.prototypes.weight.data.clone()
+            w = nn.functional.normalize(w, dim=1, p=2)
+            model.module.prototypes.weight.copy_(w)
+
+            # ============ multi-res forward passes ... ============
+            embedding, output = model(inputs)
+            embedding = embedding.detach()
+            bs = inputs[0].size(0)
+
+            # ============ swav loss ... ============
+            loss = 0
+            for i, crop_id in enumerate(args.crops_for_assign):
+                out = output[bs * crop_id: bs * (crop_id + 1)].detach()
+
+                # time to use the queue
+                if queue is not None:
+                    if use_the_queue or not torch.all(queue[i, -1, :] == 0):
+                        use_the_queue = True
+                        out = torch.cat((torch.mm(
+                            queue[i],
+                            model.module.prototypes.weight.t()
+                        ), out))
+                    # fill the queue
+                    queue[i, bs:] = queue[i, :-bs].clone()
+                    queue[i, :bs] = embedding[crop_id * bs: (crop_id + 1) * bs]
+
+                # get assignments
+                q = distributed_sinkhorn(out)[-bs:]
+
+                # cluster assignment prediction
+                for v in np.delete(np.arange(np.sum(args.nmb_crops)), crop_id):
+                    x = output[bs * v: bs * (v + 1)] / args.temperature
+                    nmis.append(normalized_mutual_info_score(labels_batch.cpu().detach().numpy(), torch.argmax(F.log_softmax(x, dim=1), dim=-1).cpu().detach().numpy())) 
+                    aris.append(adjusted_rand_score(labels_batch.cpu().detach().numpy(), torch.argmax(F.log_softmax(x, dim=1), dim=-1).cpu().detach().numpy()))
+
+
+        print(sum(nmis)/len(nmis))
+        print(sum(aris)/len(aris))
+
 
 def train(train_loader, model, optimizer, epoch, lr_schedule, queue):
     batch_time = AverageMeter()
@@ -265,8 +353,11 @@ def train(train_loader, model, optimizer, epoch, lr_schedule, queue):
     use_the_queue = False
 
     end = time.time()
+    nmis = []
     for it, inputs in enumerate(train_loader):
         # measure data loading time
+        labels_batch = inputs[1]
+        inputs = inputs[0]
         data_time.update(time.time() - end)
 
         # update learning rate
@@ -310,6 +401,8 @@ def train(train_loader, model, optimizer, epoch, lr_schedule, queue):
             subloss = 0
             for v in np.delete(np.arange(np.sum(args.nmb_crops)), crop_id):
                 x = output[bs * v: bs * (v + 1)] / args.temperature
+                with torch.no_grad():
+                    nmis.append(normalized_mutual_info_score(labels_batch.cpu().detach().numpy(), torch.argmax(F.log_softmax(x, dim=1), dim=-1).cpu().detach().numpy()))
                 subloss -= torch.mean(torch.sum(q * F.log_softmax(x, dim=1), dim=1))
             loss += subloss / (np.sum(args.nmb_crops) - 1)
         loss /= len(args.crops_for_assign)
@@ -347,6 +440,8 @@ def train(train_loader, model, optimizer, epoch, lr_schedule, queue):
                     lr=optimizer.optim.param_groups[0]["lr"],
                 )
             )
+            print(sum(nmis)/len(nmis))
+            nmis = []
     return (epoch, losses.avg), queue
 
 
